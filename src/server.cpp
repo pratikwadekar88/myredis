@@ -30,34 +30,36 @@ int main(){
     }
 
     std::cout<<"Server Listening at Port 1234\n";
-    int client_fd = accept(sockfd,nullptr,nullptr);
+    while(1){
+        int client_fd = accept(sockfd,nullptr,nullptr);
 
-    if(client_fd<0){
-        std::cerr<<"Accept Failed\n";
-        return 1;
+        if(client_fd<0){
+            std::cerr<<"Accept Failed\n";
+            return 1;
+        }
+        std::cout<<"Client Connected\n";
+
+        char buf[1024];
+        int n = recv(client_fd,buf, sizeof(buf),0);
+        if(n<0){
+            std::cerr<<"Recv Failed\n";
+            return 1;
+        }
+        std::cout<<"Received: ";
+
+        const char* response = "Hello From Myredis!\n";
+
+        n = send(client_fd,response,strlen(response),0);
+
+        if(n<0){
+            std::cerr<<"Send Failed\n";
+            return 1;
+        }
+        // Why .write -> cout << buf expects buf to be a null-terminated C string.
+        std::cout.write(buf,n);
+        std::cout<<"\n";
+        close(client_fd);
     }
-    std::cout<<"Client Connected\n";
-
-    char buf[1024];
-    int n = recv(client_fd,buf, sizeof(buf),0);
-    if(n<0){
-        std::cerr<<"Recv Failed\n";
-        return 1;
-    }
-    std::cout<<"Received: ";
-
-    const char* response = "Hello From Myredis!\n";
-
-    n = send(client_fd,response,strlen(response),0);
-
-    if(n<0){
-        std::cerr<<"Send Failed\n";
-        return 1;
-    }
-    // Why .write -> cout << buf expects buf to be a null-terminated C string.
-    std::cout.write(buf,n);
-    std::cout<<"\n";
-    close(client_fd);
     close(sockfd);
     return 0;
 }
