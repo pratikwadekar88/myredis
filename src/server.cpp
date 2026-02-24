@@ -49,22 +49,23 @@ static void fd_set_nb(int fd) {
 
 const size_t k_max_msg = 32 << 20;
 
+typedef std::vector<uint8_t> Buffer;
+
+static void buf_append(Buffer &buf, const uint8_t *data, size_t len) {
+    buf.insert(buf.end(), data, data + len);
+}
+static void buf_consume(Buffer &buf, size_t n) {
+    buf.erase(buf.begin(), buf.begin() + n);
+}
+
 struct Conn {
     int fd = -1;
     bool want_read = false;
     bool want_write = false;
     bool want_close = false;
-    std::vector<uint8_t> incoming;
-    std::vector<uint8_t> outgoing;
+    Buffer incoming;
+    Buffer outgoing;
 };
-
-static void buf_append(std::vector<uint8_t> &buf, const uint8_t *data, size_t len) {
-    buf.insert(buf.end(), data, data + len);
-}
-
-static void buf_consume(std::vector<uint8_t> &buf, size_t n) {
-    buf.erase(buf.begin(), buf.begin() + n);
-}
 
 // ─── Request Parsing ──────────────────────────────────────────────────────────
 
@@ -100,18 +101,87 @@ static int32_t parse_req(const uint8_t *data, size_t size, std::vector<std::stri
     return 0;
 }
 
-// ─── Response Status Codes ────────────────────────────────────────────────────
+// ─── Serialization Protocol ───────────────────────────────────────────────────
+// Response types (tagged union format)
 
-enum { RES_OK = 0, RES_ERR = 1, RES_NX = 2 };
-
-struct Response {
-    uint32_t status = 0;
-    std::vector<uint8_t> data;
+enum {
+    TAG_NIL = 0,    // nil
+    TAG_ERR = 1,    // error code + msg
+    TAG_STR = 2,    // string
+    TAG_INT = 3,    // int64
+    TAG_DBL = 4,    // double
+    TAG_ARR = 5,    // array
 };
+
+// error codes
+enum {
+    ERR_UNKNOWN = 1,    // unknown command
+    ERR_TOO_BIG = 2,    // response too big
+};
+
+static void buf_append_u8(Buffer &buf, uint8_t data) {
+    buf.push_back(data);
+}
+static void buf_append_u32(Buffer &buf, uint32_t data) {
+    buf_append(buf, (const uint8_t *)&data, 4);
+}
+static void buf_append_i64(Buffer &buf, int64_t data) {
+    buf_append(buf, (const uint8_t *)&data, 8);
+}
+static void buf_append_dbl(Buffer &buf, double data) {
+    buf_append(buf, (const uint8_t *)&data, 8);
+}
+
+static void out_nil(Buffer &out) {
+    buf_append_u8(out, TAG_NIL);
+}
+static void out_str(Buffer &out, const char *s, size_t size) {
+    buf_append_u8(out, TAG_STR);
+    buf_append_u32(out, (uint32_t)size);
+    buf_append(out, (const uint8_t *)s, size);
+}
+static void out_int(Buffer &out, int64_t val) {
+    buf_append_u8(out, TAG_INT);
+    buf_append_i64(out, val);
+}
+static void out_dbl(Buffer &out, double val) {
+    buf_append_u8(out, TAG_DBL);
+    buf_append_dbl(out, val);
+}
+static void out_err(Buffer &out, uint32_t code, const std::string &msg) {
+    buf_append_u8(out, TAG_ERR);
+    buf_append_u32(out, code);
+    buf_append_u32(out, (uint32_t)msg.size());
+    buf_append(out, (const uint8_t *)msg.data(), msg.size());
+}
+static void out_arr(Buffer &out, uint32_t n) {
+    buf_append_u8(out, TAG_ARR);
+    buf_append_u32(out, n);
+}
+
+// ─── Message Framing ─────────────────────────────────────────────────────────
+// Format: [4-byte length][payload]
+
+static size_t response_begin(Buffer &out) {
+    size_t header = out.size();
+    buf_append_u32(out, 0); // placeholder for length
+    return header;
+}
+
+static void response_end(Buffer &out, size_t header) {
+    size_t msg_size = out.size() - header - 4;
+    if (msg_size > k_max_msg) {
+        // truncate and send error instead
+        out.resize(header + 4);
+        out_err(out, ERR_TOO_BIG, "response is too big.");
+        msg_size = out.size() - header - 4;
+    }
+    uint32_t len = (uint32_t)msg_size;
+    memcpy(&out[header], &len, 4);
+}
 
 // ─── Custom Hashtable Key-Value Store ─────────────────────────────────────────
 
-// FNV hash
 static uint64_t str_hash(const uint8_t *data, size_t len) {
     uint32_t h = 0x811C9DC5;
     for (size_t i = 0; i < len; i++) {
@@ -120,12 +190,10 @@ static uint64_t str_hash(const uint8_t *data, size_t len) {
     return h;
 }
 
-// global state: the top-level hashtable
 static struct {
     HMap db;
 } g_data;
 
-// database entry — HNode must be first field for container_of
 struct Entry {
     struct HNode node;
     std::string key;
@@ -138,21 +206,21 @@ static bool entry_eq(HNode *lhs, HNode *rhs) {
     return le->key == re->key;
 }
 
-static void do_get(std::vector<std::string> &cmd, Response &out) {
+static void do_get(std::vector<std::string> &cmd, Buffer &out) {
     Entry key;
-    key.key = cmd[1];
+    key.key.swap(cmd[1]);
     key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
 
     HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
-    if (!node) { out.status = RES_NX; return; }
+    if (!node) return out_nil(out);
 
     const std::string &val = container_of(node, Entry, node)->val;
-    out.data.assign(val.begin(), val.end());
+    return out_str(out, val.data(), val.size());
 }
 
-static void do_set(std::vector<std::string> &cmd, Response &) {
+static void do_set(std::vector<std::string> &cmd, Buffer &out) {
     Entry key;
-    key.key = cmd[1];
+    key.key.swap(cmd[1]);
     key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
 
     HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
@@ -160,41 +228,50 @@ static void do_set(std::vector<std::string> &cmd, Response &) {
         container_of(node, Entry, node)->val.swap(cmd[2]);
     } else {
         Entry *ent = new Entry();
-        ent->key = cmd[1];
+        ent->key.swap(key.key);
         ent->node.hcode = str_hash((uint8_t *)ent->key.data(), ent->key.size());
         ent->val.swap(cmd[2]);
         hm_insert(&g_data.db, &ent->node);
     }
+    return out_nil(out);
 }
 
-static void do_del(std::vector<std::string> &cmd, Response &) {
+static void do_del(std::vector<std::string> &cmd, Buffer &out) {
     Entry key;
-    key.key = cmd[1];
+    key.key.swap(cmd[1]);
     key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
 
     HNode *node = hm_delete(&g_data.db, &key.node, &entry_eq);
     if (node) {
         delete container_of(node, Entry, node);
     }
+    return out_int(out, node ? 1 : 0);
 }
 
-static void do_request(std::vector<std::string> &cmd, Response &out) {
+static bool cb_keys(HNode *node, void *arg) {
+    Buffer &out = *(Buffer *)arg;
+    const std::string &key = container_of(node, Entry, node)->key;
+    out_str(out, key.data(), key.size());
+    return true;
+}
+
+static void do_keys(std::vector<std::string> &, Buffer &out) {
+    out_arr(out, (uint32_t)hm_size(&g_data.db));
+    hm_foreach(&g_data.db, &cb_keys, (void *)&out);
+}
+
+static void do_request(std::vector<std::string> &cmd, Buffer &out) {
     if (cmd.size() == 2 && cmd[0] == "get") {
-        do_get(cmd, out);
+        return do_get(cmd, out);
     } else if (cmd.size() == 3 && cmd[0] == "set") {
-        do_set(cmd, out);
+        return do_set(cmd, out);
     } else if (cmd.size() == 2 && cmd[0] == "del") {
-        do_del(cmd, out);
+        return do_del(cmd, out);
+    } else if (cmd.size() == 1 && cmd[0] == "keys") {
+        return do_keys(cmd, out);
     } else {
-        out.status = RES_ERR;
+        return out_err(out, ERR_UNKNOWN, "unknown command.");
     }
-}
-
-static void make_response(const Response &resp, std::vector<uint8_t> &out) {
-    uint32_t resp_len = 4 + (uint32_t)resp.data.size();
-    buf_append(out, (const uint8_t *)&resp_len, 4);
-    buf_append(out, (const uint8_t *)&resp.status, 4);
-    buf_append(out, resp.data.data(), resp.data.size());
 }
 
 // ─── Connection Handlers ──────────────────────────────────────────────────────
@@ -211,9 +288,10 @@ static bool try_one_request(Conn *conn) {
         msg("bad request"); conn->want_close = true; return false;
     }
 
-    Response resp;
-    do_request(cmd, resp);
-    make_response(resp, conn->outgoing);
+    // build response with framing
+    size_t header = response_begin(conn->outgoing);
+    do_request(cmd, conn->outgoing);
+    response_end(conn->outgoing, header);
 
     buf_consume(conn->incoming, 4 + len);
     return true;
