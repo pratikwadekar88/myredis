@@ -5,6 +5,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
+#include <math.h>   // isnan
 // system
 #include <fcntl.h>
 #include <poll.h>
@@ -16,13 +17,12 @@
 #include <string>
 #include <vector>
 // proj
+#include "common.h"
 #include "hashtable.h"
+#include "zset.h"
 
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
-
-#define container_of(ptr, T, member) \
-    reinterpret_cast<T *>(reinterpret_cast<char *>(ptr) - offsetof(T, member))
 
 static void msg(const char *msg) {
     fprintf(stderr, "%s\n", msg);
@@ -102,21 +102,21 @@ static int32_t parse_req(const uint8_t *data, size_t size, std::vector<std::stri
 }
 
 // ─── Serialization Protocol ───────────────────────────────────────────────────
-// Response types (tagged union format)
 
 enum {
-    TAG_NIL = 0,    // nil
-    TAG_ERR = 1,    // error code + msg
-    TAG_STR = 2,    // string
-    TAG_INT = 3,    // int64
-    TAG_DBL = 4,    // double
-    TAG_ARR = 5,    // array
+    TAG_NIL = 0,
+    TAG_ERR = 1,
+    TAG_STR = 2,
+    TAG_INT = 3,
+    TAG_DBL = 4,
+    TAG_ARR = 5,
 };
 
-// error codes
 enum {
-    ERR_UNKNOWN = 1,    // unknown command
-    ERR_TOO_BIG = 2,    // response too big
+    ERR_UNKNOWN = 1,
+    ERR_TOO_BIG = 2,
+    ERR_BAD_TYP = 3,
+    ERR_BAD_ARG = 4,
 };
 
 static void buf_append_u8(Buffer &buf, uint8_t data) {
@@ -132,9 +132,7 @@ static void buf_append_dbl(Buffer &buf, double data) {
     buf_append(buf, (const uint8_t *)&data, 8);
 }
 
-static void out_nil(Buffer &out) {
-    buf_append_u8(out, TAG_NIL);
-}
+static void out_nil(Buffer &out) { buf_append_u8(out, TAG_NIL); }
 static void out_str(Buffer &out, const char *s, size_t size) {
     buf_append_u8(out, TAG_STR);
     buf_append_u32(out, (uint32_t)size);
@@ -158,93 +156,139 @@ static void out_arr(Buffer &out, uint32_t n) {
     buf_append_u8(out, TAG_ARR);
     buf_append_u32(out, n);
 }
-
-// ─── Message Framing ─────────────────────────────────────────────────────────
-// Format: [4-byte length][payload]
-
-static size_t response_begin(Buffer &out) {
-    size_t header = out.size();
-    buf_append_u32(out, 0); // placeholder for length
-    return header;
+// Variable-length array: writes placeholder, returns context for fixup
+static size_t out_begin_arr(Buffer &out) {
+    buf_append_u8(out, TAG_ARR);
+    size_t ctx = out.size();
+    buf_append_u32(out, 0); // filled by out_end_arr()
+    return ctx;
+}
+static void out_end_arr(Buffer &out, size_t ctx, uint32_t n) {
+    assert(out[ctx - 1] == TAG_ARR);
+    memcpy(&out[ctx], &n, 4);
 }
 
+// ─── Message Framing ─────────────────────────────────────────────────────────
+
+static void response_begin(Buffer &out, size_t *header) {
+    *header = out.size();
+    buf_append_u32(out, 0); // reserve space for length
+}
+static size_t response_size(Buffer &out, size_t header) {
+    return out.size() - header - 4;
+}
 static void response_end(Buffer &out, size_t header) {
-    size_t msg_size = out.size() - header - 4;
+    size_t msg_size = response_size(out, header);
     if (msg_size > k_max_msg) {
-        // truncate and send error instead
         out.resize(header + 4);
         out_err(out, ERR_TOO_BIG, "response is too big.");
-        msg_size = out.size() - header - 4;
+        msg_size = response_size(out, header);
     }
     uint32_t len = (uint32_t)msg_size;
     memcpy(&out[header], &len, 4);
 }
 
-// ─── Custom Hashtable Key-Value Store ─────────────────────────────────────────
-
-static uint64_t str_hash(const uint8_t *data, size_t len) {
-    uint32_t h = 0x811C9DC5;
-    for (size_t i = 0; i < len; i++) {
-        h = (h + data[i]) * 0x01000193;
-    }
-    return h;
-}
+// ─── Key-Value Store with Typed Entries ─────────────────────────────────────
 
 static struct {
     HMap db;
 } g_data;
 
-struct Entry {
-    struct HNode node;
-    std::string key;
-    std::string val;
+// entry types
+enum {
+    T_STR   = 1,
+    T_ZSET  = 2,
 };
 
-static bool entry_eq(HNode *lhs, HNode *rhs) {
-    struct Entry *le = container_of(lhs, struct Entry, node);
-    struct Entry *re = container_of(rhs, struct Entry, node);
-    return le->key == re->key;
+struct Entry {
+    struct HNode node;  // embedded in hashtable
+    std::string key;
+    uint32_t type = 0;
+    // value union
+    std::string str;    // T_STR
+    ZSet zset;          // T_ZSET
+};
+
+struct LookupKey {
+    struct HNode node;
+    std::string key;
+};
+
+static bool entry_eq(HNode *node, HNode *key) {
+    struct Entry *ent = container_of(node, struct Entry, node);
+    struct LookupKey *keydata = container_of(key, struct LookupKey, node);
+    return ent->key == keydata->key;
 }
 
+static Entry *entry_new(uint32_t type) {
+    Entry *ent = new Entry();
+    ent->type = type;
+    return ent;
+}
+
+static void entry_del(Entry *ent) {
+    if (ent->type == T_ZSET) {
+        zset_clear(&ent->zset);
+    }
+    delete ent;
+}
+
+// ─── Helper: string to numeric ───────────────────────────────────────────────
+
+static bool str2dbl(const std::string &s, double &out) {
+    char *endp = NULL;
+    out = strtod(s.c_str(), &endp);
+    return endp == s.c_str() + s.size() && !isnan(out);
+}
+
+static bool str2int(const std::string &s, int64_t &out) {
+    char *endp = NULL;
+    out = strtoll(s.c_str(), &endp, 10);
+    return endp == s.c_str() + s.size();
+}
+
+// ─── Command Handlers ────────────────────────────────────────────────────────
+
 static void do_get(std::vector<std::string> &cmd, Buffer &out) {
-    Entry key;
+    LookupKey key;
     key.key.swap(cmd[1]);
     key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
 
     HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
     if (!node) return out_nil(out);
 
-    const std::string &val = container_of(node, Entry, node)->val;
-    return out_str(out, val.data(), val.size());
+    Entry *ent = container_of(node, Entry, node);
+    if (ent->type != T_STR) return out_err(out, ERR_BAD_TYP, "not a string value");
+    return out_str(out, ent->str.data(), ent->str.size());
 }
 
 static void do_set(std::vector<std::string> &cmd, Buffer &out) {
-    Entry key;
+    LookupKey key;
     key.key.swap(cmd[1]);
     key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
 
     HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
     if (node) {
-        container_of(node, Entry, node)->val.swap(cmd[2]);
+        Entry *ent = container_of(node, Entry, node);
+        if (ent->type != T_STR) return out_err(out, ERR_BAD_TYP, "a non-string value exists");
+        ent->str.swap(cmd[2]);
     } else {
-        Entry *ent = new Entry();
+        Entry *ent = entry_new(T_STR);
         ent->key.swap(key.key);
-        ent->node.hcode = str_hash((uint8_t *)ent->key.data(), ent->key.size());
-        ent->val.swap(cmd[2]);
+        ent->node.hcode = key.node.hcode;
+        ent->str.swap(cmd[2]);
         hm_insert(&g_data.db, &ent->node);
     }
     return out_nil(out);
 }
 
 static void do_del(std::vector<std::string> &cmd, Buffer &out) {
-    Entry key;
+    LookupKey key;
     key.key.swap(cmd[1]);
     key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
 
     HNode *node = hm_delete(&g_data.db, &key.node, &entry_eq);
-    if (node) {
-        delete container_of(node, Entry, node);
-    }
+    if (node) entry_del(container_of(node, Entry, node));
     return out_int(out, node ? 1 : 0);
 }
 
@@ -260,18 +304,105 @@ static void do_keys(std::vector<std::string> &, Buffer &out) {
     hm_foreach(&g_data.db, &cb_keys, (void *)&out);
 }
 
-static void do_request(std::vector<std::string> &cmd, Buffer &out) {
-    if (cmd.size() == 2 && cmd[0] == "get") {
-        return do_get(cmd, out);
-    } else if (cmd.size() == 3 && cmd[0] == "set") {
-        return do_set(cmd, out);
-    } else if (cmd.size() == 2 && cmd[0] == "del") {
-        return do_del(cmd, out);
-    } else if (cmd.size() == 1 && cmd[0] == "keys") {
-        return do_keys(cmd, out);
+// ─── ZSet helper: lookup or return empty ─────────────────────────────────────
+
+static const ZSet k_empty_zset;
+
+static ZSet *expect_zset(std::string &s) {
+    LookupKey key;
+    key.key.swap(s);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    if (!hnode) return (ZSet *)&k_empty_zset;
+    Entry *ent = container_of(hnode, Entry, node);
+    return ent->type == T_ZSET ? &ent->zset : NULL;
+}
+
+// zadd zset score name
+static void do_zadd(std::vector<std::string> &cmd, Buffer &out) {
+    double score = 0;
+    if (!str2dbl(cmd[2], score)) return out_err(out, ERR_BAD_ARG, "expect float");
+
+    LookupKey key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
+
+    Entry *ent = NULL;
+    if (!hnode) {
+        ent = entry_new(T_ZSET);
+        ent->key.swap(key.key);
+        ent->node.hcode = key.node.hcode;
+        hm_insert(&g_data.db, &ent->node);
     } else {
-        return out_err(out, ERR_UNKNOWN, "unknown command.");
+        ent = container_of(hnode, Entry, node);
+        if (ent->type != T_ZSET) return out_err(out, ERR_BAD_TYP, "expect zset");
     }
+
+    const std::string &name = cmd[3];
+    bool added = zset_insert(&ent->zset, name.data(), name.size(), score);
+    return out_int(out, (int64_t)added);
+}
+
+// zrem zset name
+static void do_zrem(std::vector<std::string> &cmd, Buffer &out) {
+    ZSet *zset = expect_zset(cmd[1]);
+    if (!zset) return out_err(out, ERR_BAD_TYP, "expect zset");
+
+    const std::string &name = cmd[2];
+    ZNode *znode = zset_lookup(zset, name.data(), name.size());
+    if (znode) zset_delete(zset, znode);
+    return out_int(out, znode ? 1 : 0);
+}
+
+// zscore zset name
+static void do_zscore(std::vector<std::string> &cmd, Buffer &out) {
+    ZSet *zset = expect_zset(cmd[1]);
+    if (!zset) return out_err(out, ERR_BAD_TYP, "expect zset");
+
+    const std::string &name = cmd[2];
+    ZNode *znode = zset_lookup(zset, name.data(), name.size());
+    return znode ? out_dbl(out, znode->score) : out_nil(out);
+}
+
+// zquery zset score name offset limit
+static void do_zquery(std::vector<std::string> &cmd, Buffer &out) {
+    double score = 0;
+    if (!str2dbl(cmd[2], score)) return out_err(out, ERR_BAD_ARG, "expect fp number");
+    const std::string &name = cmd[3];
+    int64_t offset = 0, limit = 0;
+    if (!str2int(cmd[4], offset) || !str2int(cmd[5], limit))
+        return out_err(out, ERR_BAD_ARG, "expect int");
+
+    ZSet *zset = expect_zset(cmd[1]);
+    if (!zset) return out_err(out, ERR_BAD_TYP, "expect zset");
+
+    if (limit <= 0) return out_arr(out, 0);
+
+    ZNode *znode = zset_seekge(zset, score, name.data(), name.size());
+    znode = znode_offset(znode, offset);
+
+    size_t ctx = out_begin_arr(out);
+    int64_t n = 0;
+    while (znode && n < limit) {
+        out_str(out, znode->name, znode->len);
+        out_dbl(out, znode->score);
+        znode = znode_offset(znode, +1);
+        n += 2;
+    }
+    out_end_arr(out, ctx, (uint32_t)n);
+}
+
+static void do_request(std::vector<std::string> &cmd, Buffer &out) {
+    if      (cmd.size() == 2 && cmd[0] == "get")    return do_get(cmd, out);
+    else if (cmd.size() == 3 && cmd[0] == "set")    return do_set(cmd, out);
+    else if (cmd.size() == 2 && cmd[0] == "del")    return do_del(cmd, out);
+    else if (cmd.size() == 1 && cmd[0] == "keys")   return do_keys(cmd, out);
+    else if (cmd.size() == 4 && cmd[0] == "zadd")   return do_zadd(cmd, out);
+    else if (cmd.size() == 3 && cmd[0] == "zrem")   return do_zrem(cmd, out);
+    else if (cmd.size() == 3 && cmd[0] == "zscore") return do_zscore(cmd, out);
+    else if (cmd.size() == 6 && cmd[0] == "zquery") return do_zquery(cmd, out);
+    else return out_err(out, ERR_UNKNOWN, "unknown command.");
 }
 
 // ─── Connection Handlers ──────────────────────────────────────────────────────
@@ -288,8 +419,8 @@ static bool try_one_request(Conn *conn) {
         msg("bad request"); conn->want_close = true; return false;
     }
 
-    // build response with framing
-    size_t header = response_begin(conn->outgoing);
+    size_t header = 0;
+    response_begin(conn->outgoing, &header);
     do_request(cmd, conn->outgoing);
     response_end(conn->outgoing, header);
 
