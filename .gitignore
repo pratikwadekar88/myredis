@@ -1,2 +1,5 @@
 myredis
+client
 src/myredis
+src/client
+*.o
